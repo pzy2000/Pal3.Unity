@@ -14,6 +14,10 @@
  * game's own console commands (the exact mechanism the game uses for its text
  * save files and DevCommands story jumps), validates manager state, runs smoke
  * actions, checks oracle assertions, and writes a structured JSON report.
+ *
+ * RunC1 is a separate headed/persistent path. Its restore_target operation is
+ * setup-only and cannot execute actions or assertions; the agent must perform
+ * Phase B through the public game UI before read-only semantic_goal probing.
  */
 
 using System;
@@ -50,16 +54,189 @@ namespace Pal3.Game.Command
     public static class WarptestCheckpoint
     {
         const string GameScenePath = "Assets/Scenes/Game.unity";
+        internal const string C1SessionVersion = "warptest-c1-unity-v2";
+        const string StateEvidenceVersion = "warptest-unity-checkpoint-state-v1";
 
 #if UNITY_EDITOR
         const string PendingKey = "WarpTest.Pal3.Pending";
         const string PendingRequestPathKey = "WarpTest.Pal3.PendingRequestPath";
         const string PendingReportPathKey = "WarpTest.Pal3.PendingReportPath";
+        const string C1PendingKey = "WarpTest.Pal3.C1Pending";
+        const string C1RequestPathKey = "WarpTest.Pal3.C1RequestPath";
+        const string C1ReportPathKey = "WarpTest.Pal3.C1ReportPath";
+        const string C1ReadyPathKey = "WarpTest.Pal3.C1ReadyPath";
         static int s_pendingPlayModeFrames;
+        static int s_pendingC1PlayModeFrames;
+        static bool s_c1TransitionRequired;
+        static int s_c1TransitionSlot = -1;
+        static int s_c1TransitionArmedSequence = -1;
+        static bool s_c1SaveObserved;
+        static bool s_c1ResetObserved;
+        static bool s_c1SceneLoadObserved;
+        static bool s_c1LoadObserved;
+        static int s_c1SaveFrame = -1;
+        static int s_c1ResetFrame = -1;
+        static int s_c1SceneLoadFrame = -1;
+        static int s_c1LoadFrame = -1;
+        static PalGameScene s_c1SceneAtSave;
+        static string s_c1SavedSceneCity = "";
+        static string s_c1SavedSceneName = "";
+
+        internal static void ResetC1TransitionWitness()
+        {
+            s_c1TransitionRequired = false;
+            s_c1TransitionSlot = -1;
+            s_c1TransitionArmedSequence = -1;
+            s_c1SaveObserved = false;
+            s_c1ResetObserved = false;
+            s_c1SceneLoadObserved = false;
+            s_c1LoadObserved = false;
+            s_c1SaveFrame = -1;
+            s_c1ResetFrame = -1;
+            s_c1SceneLoadFrame = -1;
+            s_c1LoadFrame = -1;
+            s_c1SceneAtSave = null;
+            s_c1SavedSceneCity = "";
+            s_c1SavedSceneName = "";
+        }
+
+        static bool HasC1TransitionExpectation(WarptestC1TransitionExpectation expectation)
+        {
+            return expectation != null
+                && (!string.IsNullOrEmpty(expectation.kind) || expectation.slot >= 0);
+        }
+
+        static bool ArmC1TransitionWitness(WarptestC1TransitionExpectation expectation, int sequence)
+        {
+            ResetC1TransitionWitness();
+            if (!HasC1TransitionExpectation(expectation))
+                return true;
+            if (expectation.kind != "save_then_load" || expectation.slot < 0)
+                return false;
+            s_c1TransitionRequired = true;
+            s_c1TransitionSlot = expectation.slot;
+            s_c1TransitionArmedSequence = sequence;
+            return true;
+        }
+
+        internal static void ObserveC1Log(string condition, string stackTrace, LogType type)
+        {
+            if (!s_c1TransitionRequired || string.IsNullOrEmpty(condition)
+                || condition.IndexOf("[SaveManager] Game state saved to:", StringComparison.Ordinal) < 0)
+                return;
+            string normalized = condition.Replace('\\', '/');
+            if (!normalized.EndsWith($"slot_{s_c1TransitionSlot}_v1.txt", StringComparison.Ordinal))
+                return;
+            s_c1SaveObserved = true;
+            s_c1SaveFrame = Time.frameCount;
+            s_c1SceneAtSave = TryGetService<PalSceneManager>()?.GetCurrentScene();
+            string city;
+            string scene;
+            if (CurrentSceneInfo(out city, out scene))
+            {
+                s_c1SavedSceneCity = city;
+                s_c1SavedSceneName = scene;
+            }
+        }
+
+        internal static void ObserveC1ResetCommand()
+        {
+            if (!s_c1TransitionRequired || !s_c1SaveObserved || s_c1LoadObserved)
+                return;
+            s_c1ResetObserved = true;
+            s_c1ResetFrame = Time.frameCount;
+        }
+
+        internal static void ObserveC1SceneLoadCommand(SceneLoadCommand command)
+        {
+            if (!s_c1TransitionRequired || !s_c1SaveObserved || !s_c1ResetObserved
+                || s_c1LoadObserved || command == null)
+                return;
+            if (!string.Equals(command.SceneCityName, s_c1SavedSceneCity, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(command.SceneName, s_c1SavedSceneName, StringComparison.OrdinalIgnoreCase))
+                return;
+            s_c1SceneLoadObserved = true;
+            s_c1SceneLoadFrame = Time.frameCount;
+        }
+
+        internal static void ObserveC1Transition()
+        {
+            if (!s_c1TransitionRequired || !s_c1SaveObserved || !s_c1ResetObserved
+                || !s_c1SceneLoadObserved || s_c1LoadObserved || s_c1SceneAtSave == null)
+                return;
+            PalGameScene current = TryGetService<PalSceneManager>()?.GetCurrentScene();
+            if (current != null && !ReferenceEquals(current, s_c1SceneAtSave))
+            {
+                s_c1LoadObserved = true;
+                s_c1LoadFrame = Time.frameCount;
+            }
+        }
+
+        static bool C1ExpectationMatches(WarptestC1TransitionExpectation expectation)
+        {
+            return expectation != null
+                && expectation.kind == "save_then_load"
+                && expectation.slot == s_c1TransitionSlot;
+        }
+
+        static WarptestC1TransitionEvidence C1TransitionEvidence(int sequence)
+        {
+            return new WarptestC1TransitionEvidence
+            {
+                required = s_c1TransitionRequired,
+                kind = s_c1TransitionRequired ? "save_then_load" : "",
+                slot = s_c1TransitionSlot,
+                source = "pal3_public_ui_save_load_witness_v1",
+                armed_sequence = s_c1TransitionArmedSequence,
+                observed_sequence = sequence,
+                save_observed = s_c1SaveObserved,
+                reset_observed = s_c1ResetObserved,
+                scene_load_observed = s_c1SceneLoadObserved,
+                load_observed = s_c1LoadObserved,
+                save_frame = s_c1SaveFrame,
+                reset_frame = s_c1ResetFrame,
+                scene_load_frame = s_c1SceneLoadFrame,
+                load_frame = s_c1LoadFrame,
+                ordered = s_c1SaveObserved && s_c1ResetObserved
+                    && s_c1SceneLoadObserved && s_c1LoadObserved
+                    && s_c1ResetFrame >= s_c1SaveFrame
+                    && s_c1SceneLoadFrame >= s_c1ResetFrame
+                    && s_c1LoadFrame >= s_c1SceneLoadFrame,
+            };
+        }
+
+        static void AddC1TransitionGoalChecks(
+            WarptestC1TransitionExpectation expectation,
+            List<WarptestCheck> checks)
+        {
+            if (!HasC1TransitionExpectation(expectation) && !s_c1TransitionRequired)
+                return;
+            bool matches = s_c1TransitionRequired && C1ExpectationMatches(expectation);
+            checks.Add(matches
+                ? Ok("c1.transition.expectation", $"Armed save/load witness for slot {s_c1TransitionSlot}.")
+                : Fail("c1.transition.expectation", "Goal transition expectation was missing, malformed, or changed after semantic_start."));
+            checks.Add(s_c1SaveObserved
+                ? Ok("c1.transition.save", $"Observed successful public-UI save to slot {s_c1TransitionSlot} at frame {s_c1SaveFrame}.")
+                : Fail("c1.transition.save", $"No successful public-UI save to slot {s_c1TransitionSlot} was observed after semantic_start."));
+            bool ordered = s_c1SaveObserved && s_c1ResetObserved
+                && s_c1SceneLoadObserved && s_c1LoadObserved
+                && s_c1ResetFrame >= s_c1SaveFrame
+                && s_c1SceneLoadFrame >= s_c1ResetFrame
+                && s_c1LoadFrame >= s_c1SceneLoadFrame;
+            checks.Add(ordered
+                ? Ok("c1.transition.load", $"Observed ordered reset + saved-scene replay after the slot-{s_c1TransitionSlot} save.")
+                : Fail("c1.transition.load", $"No ordered public-UI load replay of slot {s_c1TransitionSlot} was observed after its save."));
+        }
 
         [UnityEditor.InitializeOnLoadMethod]
         static void ResumePendingPlayModeRun()
         {
+            if (UnityEditor.EditorPrefs.GetBool(C1PendingKey, false))
+            {
+                s_pendingC1PlayModeFrames = 30;
+                UnityEditor.EditorApplication.update -= RunPendingC1WhenPlayModeReady;
+                UnityEditor.EditorApplication.update += RunPendingC1WhenPlayModeReady;
+            }
             if (!UnityEditor.EditorPrefs.GetBool(PendingKey, false))
                 return;
             s_pendingPlayModeFrames = 30;
@@ -100,7 +277,101 @@ namespace Pal3.Game.Command
 #endif
         }
 
+        public static void RunC1()
+        {
+            string requestPath = null;
+            string reportPath = null;
+            string readyPath = null;
+            var args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--warptest-c1-request" && i + 1 < args.Length)
+                    requestPath = args[i + 1];
+                if (args[i] == "--warptest-c1-report" && i + 1 < args.Length)
+                    reportPath = args[i + 1];
+                if (args[i] == "--warptest-c1-ready" && i + 1 < args.Length)
+                    readyPath = args[i + 1];
+            }
+            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath) || string.IsNullOrEmpty(readyPath))
+            {
+                Debug.LogError("[WarpTest C1] Missing request/report/ready arguments.");
+                EditorQuit(1);
+                return;
+            }
 #if UNITY_EDITOR
+            if (MaybeQueueC1PlayModeRun(requestPath, reportPath, readyPath))
+                return;
+            StartC1Runner(requestPath, reportPath, readyPath);
+#else
+            Debug.LogError("[WarpTest C1] PAL3 C1 requires Unity editor play mode.");
+            EditorQuit(1);
+#endif
+        }
+
+#if UNITY_EDITOR
+        static bool MaybeQueueC1PlayModeRun(string requestPath, string reportPath, string readyPath)
+        {
+            if (Application.isPlaying)
+                return false;
+            try
+            {
+                if (File.Exists(GameScenePath))
+                    UnityEditor.SceneManagement.EditorSceneManager.OpenScene(GameScenePath);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[WarpTest C1] Unable to open {GameScenePath}: {e.Message}");
+            }
+            UnityEditor.EditorPrefs.SetBool(C1PendingKey, true);
+            UnityEditor.EditorPrefs.SetString(C1RequestPathKey, requestPath);
+            UnityEditor.EditorPrefs.SetString(C1ReportPathKey, reportPath);
+            UnityEditor.EditorPrefs.SetString(C1ReadyPathKey, readyPath);
+            s_pendingC1PlayModeFrames = 30;
+            UnityEditor.EditorApplication.update -= RunPendingC1WhenPlayModeReady;
+            UnityEditor.EditorApplication.update += RunPendingC1WhenPlayModeReady;
+            UnityEditor.EditorApplication.isPlaying = true;
+            Debug.Log("[WarpTest C1] Queued persistent PAL3 play-mode session.");
+            return true;
+        }
+
+        static void RunPendingC1WhenPlayModeReady()
+        {
+            if (!UnityEditor.EditorApplication.isPlaying)
+                return;
+            if (s_pendingC1PlayModeFrames-- > 0)
+                return;
+            UnityEditor.EditorApplication.update -= RunPendingC1WhenPlayModeReady;
+            var requestPath = UnityEditor.EditorPrefs.GetString(C1RequestPathKey, "");
+            var reportPath = UnityEditor.EditorPrefs.GetString(C1ReportPathKey, "");
+            var readyPath = UnityEditor.EditorPrefs.GetString(C1ReadyPathKey, "");
+            UnityEditor.EditorPrefs.DeleteKey(C1PendingKey);
+            UnityEditor.EditorPrefs.DeleteKey(C1RequestPathKey);
+            UnityEditor.EditorPrefs.DeleteKey(C1ReportPathKey);
+            UnityEditor.EditorPrefs.DeleteKey(C1ReadyPathKey);
+            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath) || string.IsNullOrEmpty(readyPath))
+            {
+                Debug.LogError("[WarpTest C1] Pending session lost IPC paths.");
+                EditorQuit(1);
+                return;
+            }
+            StartC1Runner(requestPath, reportPath, readyPath);
+        }
+
+        static void FocusAndMaximizeGameView()
+        {
+            try
+            {
+                var gameViewType = typeof(UnityEditor.EditorWindow).Assembly.GetType("UnityEditor.GameView");
+                var gameView = UnityEditor.EditorWindow.GetWindow(gameViewType);
+                gameView.maximized = true;
+                gameView.Focus();
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[WarpTest C1] Unable to maximize Game view: {e.Message}");
+            }
+        }
+
         // Pal3 always needs play mode because managers only exist after the Pal3
         // prefab runs OnEnable. Open the Game scene and enter play mode, then
         // resume after the domain reload via EditorPrefs + update callback.
@@ -152,6 +423,19 @@ namespace Pal3.Game.Command
             }
 
             StartRunner(requestPath, reportPath);
+        }
+#endif
+
+#if UNITY_EDITOR
+        static void StartC1Runner(string requestPath, string reportPath, string readyPath)
+        {
+            var existing = UnityEngine.Object.FindObjectOfType<WarptestC1RunnerBehaviour>();
+            if (existing != null) UnityEngine.Object.Destroy(existing.gameObject);
+            var host = new GameObject("WarptestC1Runner");
+            UnityEngine.Object.DontDestroyOnLoad(host);
+            var runner = host.AddComponent<WarptestC1RunnerBehaviour>();
+            runner.Begin(requestPath, reportPath, readyPath);
+            FocusAndMaximizeGameView();
         }
 #endif
 
@@ -920,6 +1204,217 @@ namespace Pal3.Game.Command
             return high - low >= 8;
         }
 
+        // ---- Persistent headed C1 operations ----
+
+        internal static IEnumerator ProcessC1RequestCoroutine(WarptestC1Request request, Action<WarptestC1Report> done)
+        {
+            var checks = new List<WarptestCheck>();
+            var report = new WarptestC1Report
+            {
+                version = C1SessionVersion,
+                sequence = request != null ? request.sequence : -1,
+                operation = request != null ? request.operation : "",
+                status = "failure",
+                detail = "C1 request failed.",
+                checks = checks,
+                screenshot_path = request != null ? request.screenshot_output_path ?? "" : "",
+                screenshot_status = "skipped",
+                screenshot_source = "",
+                screenshot_detail = "",
+            };
+            if (request == null || request.version != C1SessionVersion)
+            {
+                report.status = "rejected";
+                report.detail = "Unexpected or missing C1 protocol version.";
+                done(report);
+                yield break;
+            }
+            if (request.spec == null)
+                request.spec = new WarptestSpec { target = new WarptestTarget() };
+            if (request.spec.target == null)
+                request.spec.target = new WarptestTarget();
+
+            switch (request.operation)
+            {
+                case "clean_entry":
+                {
+                    ResetC1TransitionWitness();
+                    AsyncOperation load = null;
+                    try { load = UnityEngine.SceneManagement.SceneManager.LoadSceneAsync("Game"); }
+                    catch (Exception e)
+                    {
+                        report.status = "engine_error";
+                        report.detail = $"Unable to load PAL3 startup scene: {e.Message}";
+                        done(report);
+                        yield break;
+                    }
+                    if (load == null)
+                    {
+                        report.status = "engine_error";
+                        report.detail = "Unable to load PAL3 startup scene.";
+                        done(report);
+                        yield break;
+                    }
+                    yield return load;
+                    bool ready = false;
+                    yield return WaitForGameReady(ok => ready = ok);
+                    checks.Add(ready
+                        ? Ok("c1.clean_entry", "Loaded the public PAL3 startup scene.")
+                        : Fail("c1.clean_entry", "PAL3 managers did not become ready after startup reload."));
+                    break;
+                }
+                case "restore_target":
+                {
+                    ResetC1TransitionWitness();
+                    // SECURITY INVARIANT: this branch deliberately never reads or
+                    // iterates the Phase B action or goal-assertion lists.
+                    bool ready = false;
+                    yield return WaitForGameReady(ok => ready = ok);
+                    if (!ready)
+                    {
+                        checks.Add(Fail("c1.target.game_ready", "PAL3 managers never became available."));
+                        break;
+                    }
+                    if (request.spec.target.save_index >= 0)
+                        yield return LoadSaveCheckpoint(request.spec.target.save_index, checks);
+                    else
+                        yield return SynthesizeState(request.spec.target, checks);
+                    if (checks.All(c => c.status == "success") && request.spec.validations != null)
+                        foreach (var validation in request.spec.validations)
+                            checks.Add(ValidateField(validation));
+                    break;
+                }
+                case "semantic_start":
+                {
+                    bool transitionExpectationValid = ArmC1TransitionWitness(
+                        request.transition_expectation, request.sequence);
+                    if (HasC1TransitionExpectation(request.transition_expectation))
+                        checks.Add(transitionExpectationValid
+                            ? Ok("c1.transition.armed", $"Armed public-UI save/load witness for slot {request.transition_expectation.slot}.")
+                            : Fail("c1.transition.armed", "Invalid save/load transition expectation."));
+                    checks.AddRange(CheckC1Target(request.spec.target));
+                    if (request.spec.validations != null)
+                        foreach (var validation in request.spec.validations)
+                            checks.Add(ValidateField(validation));
+                    break;
+                }
+                case "semantic_goal":
+                    if (request.spec.assertions == null || request.spec.assertions.Count == 0)
+                        checks.Add(Fail("c1.semantic_goal", "No goal assertions were declared."));
+                    else
+                        foreach (var assertion in request.spec.assertions)
+                            checks.Add(CheckAssertion(assertion));
+                    AddC1TransitionGoalChecks(request.transition_expectation, checks);
+                    break;
+                case "capture":
+                    if (string.IsNullOrEmpty(request.screenshot_output_path))
+                    {
+                        report.status = "rejected";
+                        report.detail = "capture requires screenshot_output_path.";
+                        done(report);
+                        yield break;
+                    }
+                    for (int i = 0; i < 5; i++) yield return null;
+                    try
+                    {
+                        string directory = Path.GetDirectoryName(request.screenshot_output_path);
+                        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                        string detail = CaptureScreenshotToFile(request.screenshot_output_path);
+                        report.screenshot_status = "success";
+                        report.screenshot_source = "unity_capture";
+                        report.screenshot_detail = detail;
+                        checks.Add(Ok("c1.live_capture", detail));
+                    }
+                    catch (Exception e)
+                    {
+                        if (File.Exists(request.screenshot_output_path)) File.Delete(request.screenshot_output_path);
+                        report.status = "engine_error";
+                        report.detail = e.Message;
+                        report.screenshot_status = "failure";
+                        report.screenshot_source = "capture_failure";
+                        report.screenshot_detail = e.Message;
+                        done(report);
+                        yield break;
+                    }
+                    break;
+                case "close":
+                    checks.Add(Ok("c1.close", "Close acknowledged."));
+                    break;
+                default:
+                    report.status = "rejected";
+                    report.detail = $"Unsupported C1 operation: {request.operation ?? "<missing>"}";
+                    done(report);
+                    yield break;
+            }
+
+            report.transition_evidence = C1TransitionEvidence(request.sequence);
+            bool allOk = checks.Count > 0 && checks.All(c => c.status == "success");
+            report.status = allOk ? "success" : "failure";
+            report.detail = allOk ? "C1 live operation succeeded." : "One or more C1 live checks failed.";
+            done(report);
+        }
+
+        static List<WarptestCheck> CheckC1Target(WarptestTarget target)
+        {
+            var checks = new List<WarptestCheck>();
+            if (UnityEngine.Object.FindFirstObjectByType<PalApp>() == null)
+            {
+                checks.Add(Fail("c1.target.runtime", "PAL3 runtime is not live."));
+                return checks;
+            }
+            if (!string.IsNullOrEmpty(target.scene_city) || !string.IsNullOrEmpty(target.scene_name))
+            {
+                bool hasScene = CurrentSceneInfo(out string city, out string name);
+                bool match = hasScene
+                    && string.Equals(city, target.scene_city, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(name, target.scene_name, StringComparison.OrdinalIgnoreCase);
+                checks.Add(match
+                    ? Ok("c1.target.scene", $"Scene = {city}/{name}")
+                    : Fail("c1.target.scene", $"Expected {target.scene_city}/{target.scene_name}, got {city ?? "null"}/{name ?? "null"}."));
+            }
+            if (target.money > 0)
+                checks.Add(CompareValues("c1.target.money", SafeMoney(), target.money.ToString(), "gte"));
+            if (target.team_ids != null)
+                foreach (int actorId in target.team_ids)
+                {
+                    bool present = false;
+                    try { present = TryGetService<TeamManager>().IsActorInTeam((PlayerActorId)actorId); }
+                    catch { present = false; }
+                    checks.Add(present
+                        ? Ok($"c1.target.team.actor_{actorId}", $"Actor {actorId} is in the live team.")
+                        : Fail($"c1.target.team.actor_{actorId}", $"Actor {actorId} is missing from the live team."));
+                }
+            if (target.story_vars != null)
+                foreach (var value in target.story_vars)
+                {
+                    int actual = TryGetService<IUserVariableStore<ushort, int>>().Get((ushort)value.key);
+                    checks.Add(CompareValues($"c1.target.story_var_{value.key}", actual, value.value.ToString(), "equals"));
+                }
+            if (target.items != null)
+                foreach (var item in target.items)
+                    checks.Add(CompareValues($"c1.target.item_{item.id}", ItemCount(item.id), item.count.ToString(), "gte"));
+            if (target.world_regions != null)
+                foreach (var region in target.world_regions)
+                    checks.Add(CompareValues($"c1.target.region_{region.region}", RegionFlag(region.region), region.flag.ToString(), "gte"));
+            if (target.favors != null)
+                foreach (var favor in target.favors)
+                {
+                    int actual = TryGetService<FavorManager>().GetFavorByActor(favor.actor_id);
+                    checks.Add(CompareValues($"c1.target.favor_{favor.actor_id}", actual, favor.amount.ToString(), "gte"));
+                }
+            if (checks.Count == 0)
+                checks.Add(Ok("c1.target.runtime", "PAL3 runtime is live."));
+            return checks;
+        }
+
+        internal static void WriteC1Json(string path, object payload)
+        {
+            string tempPath = path + ".tmp";
+            File.WriteAllText(tempPath, JsonUtility.ToJson(payload, true), new UTF8Encoding(false));
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tempPath, path);
+        }
+
         // ---- IO + quit ----
 
         static void WriteFailureReport(string reportPath, string detail, string checkName)
@@ -946,6 +1441,27 @@ namespace Pal3.Game.Command
             Debug.Log($"[WarpTest] Report written to {reportPath}");
         }
 
+        internal static WarptestReport AttachStateEvidence(
+            WarptestRequest request,
+            WarptestReport report)
+        {
+            if (report == null)
+                report = new WarptestReport
+                {
+                    status = "failure",
+                    detail = "No utility report produced.",
+                    checks = new List<WarptestCheck>()
+                };
+            report.evidence_version = StateEvidenceVersion;
+            report.evidence_task_id = request?.evidence_task_id ?? "";
+            report.evidence_seed = request != null ? request.evidence_seed : 0;
+            report.evidence_stage = request?.evidence_stage ?? "";
+            report.evidence_benchmark = request?.evidence_benchmark ?? "";
+            report.process_id = System.Diagnostics.Process.GetCurrentProcess().Id;
+            report.process_alive_at_observation = true;
+            return report;
+        }
+
         internal static void EditorQuit(int code)
         {
 #if UNITY_EDITOR
@@ -955,6 +1471,117 @@ namespace Pal3.Game.Command
 #endif
         }
     }
+
+    // Persistent headed C1 transport. It only dispatches to the setup/read-only
+    // C1 coroutine above; it never invokes ExecuteAction.
+#if UNITY_EDITOR
+    public sealed class WarptestC1RunnerBehaviour : MonoBehaviour,
+        ICommandExecutor<ResetGameStateCommand>,
+        ICommandExecutor<SceneLoadCommand>
+    {
+        string _requestPath;
+        string _reportPath;
+        int _lastSequence;
+        bool _busy;
+
+        public void Begin(string requestPath, string reportPath, string readyPath)
+        {
+            _requestPath = requestPath;
+            _reportPath = reportPath;
+            _lastSequence = 0;
+            Application.logMessageReceived -= WarptestCheckpoint.ObserveC1Log;
+            Application.logMessageReceived += WarptestCheckpoint.ObserveC1Log;
+            CommandExecutorRegistry<ICommand>.Instance.Register(this);
+            WarptestCheckpoint.ResetC1TransitionWitness();
+            WarptestCheckpoint.WriteC1Json(readyPath, new WarptestC1Ready
+            {
+                version = WarptestCheckpoint.C1SessionVersion,
+                sequence = 0,
+                status = "ready",
+                pid = System.Diagnostics.Process.GetCurrentProcess().Id,
+            });
+            Debug.Log("[WarpTest C1] PAL3 persistent session ready.");
+        }
+
+        void Update()
+        {
+            WarptestCheckpoint.ObserveC1Transition();
+            if (_busy || !File.Exists(_requestPath)) return;
+            WarptestC1Request request;
+            try
+            {
+                string json = File.ReadAllText(_requestPath, Encoding.UTF8);
+                if (string.IsNullOrWhiteSpace(json)) return;
+                request = JsonUtility.FromJson<WarptestC1Request>(json);
+            }
+            catch
+            {
+                return;
+            }
+            if (request == null || request.sequence <= _lastSequence) return;
+            _busy = true;
+            StartCoroutine(Process(request));
+        }
+
+        public void Execute(ResetGameStateCommand command)
+        {
+            WarptestCheckpoint.ObserveC1ResetCommand();
+        }
+
+        public void Execute(SceneLoadCommand command)
+        {
+            WarptestCheckpoint.ObserveC1SceneLoadCommand(command);
+        }
+
+        void OnDestroy()
+        {
+            Application.logMessageReceived -= WarptestCheckpoint.ObserveC1Log;
+            CommandExecutorRegistry<ICommand>.Instance.UnRegister(this);
+            WarptestCheckpoint.ResetC1TransitionWitness();
+        }
+
+        IEnumerator Process(WarptestC1Request request)
+        {
+            WarptestC1Report report = null;
+            if (request.sequence != _lastSequence + 1)
+            {
+                report = new WarptestC1Report
+                {
+                    version = WarptestCheckpoint.C1SessionVersion,
+                    sequence = request.sequence,
+                    operation = request.operation,
+                    status = "rejected",
+                    detail = $"Expected sequence {_lastSequence + 1}, got {request.sequence}.",
+                    checks = new List<WarptestCheck>(),
+                };
+            }
+            else
+            {
+                yield return WarptestCheckpoint.ProcessC1RequestCoroutine(request, value => report = value);
+            }
+            if (report == null)
+            {
+                report = new WarptestC1Report
+                {
+                    version = WarptestCheckpoint.C1SessionVersion,
+                    sequence = request.sequence,
+                    operation = request.operation,
+                    status = "engine_error",
+                    detail = "C1 coroutine produced no report.",
+                    checks = new List<WarptestCheck>(),
+                };
+            }
+            WarptestCheckpoint.WriteC1Json(_reportPath, report);
+            _lastSequence = request.sequence;
+            _busy = false;
+            if (request.operation == "close" && report.status == "success")
+            {
+                yield return null;
+                WarptestCheckpoint.EditorQuit(0);
+            }
+        }
+    }
+#endif
 
     // Drives the asynchronous checkpoint flow inside play mode without taking a
     // dependency on any specific async library.
@@ -997,6 +1624,8 @@ namespace Pal3.Game.Command
             if (report == null)
                 report = new WarptestReport { status = "failure", detail = "No report produced.", checks = checks };
 
+            report = WarptestCheckpoint.AttachStateEvidence(request, report);
+
             try { WarptestCheckpoint.WriteReport(_reportPath, report); }
             catch (Exception e) { Debug.LogError($"[WarpTest] {e}"); }
 
@@ -1007,10 +1636,78 @@ namespace Pal3.Game.Command
     // ---- JSON contract (mirrors the Python Pal3RuntimeAdapter request shape) ----
 
     [Serializable]
+    public class WarptestC1Request
+    {
+        public string version;
+        public int sequence;
+        public string operation;
+        public string spec_path;
+        public string screenshot_output_path;
+        public WarptestSpec spec;
+        public WarptestC1TransitionExpectation transition_expectation;
+    }
+
+    [Serializable]
+    public class WarptestC1Report
+    {
+        public string version;
+        public int sequence;
+        public string operation;
+        public string status;
+        public string detail;
+        public string screenshot_path;
+        public string screenshot_status;
+        public string screenshot_source;
+        public string screenshot_detail;
+        public WarptestC1TransitionEvidence transition_evidence;
+        public List<WarptestCheck> checks = new List<WarptestCheck>();
+    }
+
+    [Serializable]
+    public class WarptestC1TransitionExpectation
+    {
+        public string kind;
+        public int slot = -1;
+    }
+
+    [Serializable]
+    public class WarptestC1TransitionEvidence
+    {
+        public bool required;
+        public string kind;
+        public int slot = -1;
+        public string source;
+        public int armed_sequence = -1;
+        public int observed_sequence = -1;
+        public bool save_observed;
+        public bool reset_observed;
+        public bool scene_load_observed;
+        public bool load_observed;
+        public int save_frame = -1;
+        public int reset_frame = -1;
+        public int scene_load_frame = -1;
+        public int load_frame = -1;
+        public bool ordered;
+    }
+
+    [Serializable]
+    public class WarptestC1Ready
+    {
+        public string version;
+        public int sequence;
+        public string status;
+        public int pid;
+    }
+
+    [Serializable]
     public class WarptestRequest
     {
         public string spec_path;
         public string screenshot_output_path;
+        public string evidence_task_id;
+        public int evidence_seed;
+        public string evidence_stage;
+        public string evidence_benchmark;
         public WarptestSpec spec;
     }
 
@@ -1130,6 +1827,13 @@ namespace Pal3.Game.Command
     {
         public string status;
         public string detail;
+        public string evidence_version;
+        public string evidence_task_id;
+        public int evidence_seed;
+        public string evidence_stage;
+        public string evidence_benchmark;
+        public int process_id;
+        public bool process_alive_at_observation;
         public string screenshot_path;
         public string screenshot_status;
         public string screenshot_source;
