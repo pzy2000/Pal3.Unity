@@ -1120,23 +1120,33 @@ namespace Pal3.Game.Command
 
         static string CaptureScreenshotToFile(string outputPath)
         {
-            if (Screen.width != 1280 || Screen.height != 720)
-                throw new InvalidOperationException($"GameView size drifted to {Screen.width}x{Screen.height}; expected 1280x720.");
             if (Application.isPlaying)
             {
-                var texture = ScreenCapture.CaptureScreenshotAsTexture();
+                var source = ScreenCapture.CaptureScreenshotAsTexture();
+                RenderTexture normalizedTarget = null;
+                Texture2D texture = null;
+                var previousActive = RenderTexture.active;
                 try
                 {
-                    if (texture != null)
+                    if (source != null)
                     {
+                        normalizedTarget = RenderTexture.GetTemporary(1280, 720, 0, RenderTextureFormat.ARGB32);
+                        Graphics.Blit(source, normalizedTarget);
+                        RenderTexture.active = normalizedTarget;
+                        texture = new Texture2D(1280, 720, TextureFormat.RGB24, false);
+                        texture.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0);
+                        texture.Apply();
                         File.WriteAllBytes(outputPath, texture.EncodeToPNG());
                         if (TextureHasVisibleRange(texture))
-                            return "ScreenCapture captured final GameView pixels including overlay UI.";
+                            return $"ScreenCapture captured final GameView pixels including overlay UI and normalized {source.width}x{source.height} to 1280x720.";
                     }
                 }
                 finally
                 {
+                    RenderTexture.active = previousActive;
                     if (texture != null) UnityEngine.Object.Destroy(texture);
+                    if (normalizedTarget != null) RenderTexture.ReleaseTemporary(normalizedTarget);
+                    if (source != null) UnityEngine.Object.Destroy(source);
                 }
             }
 
@@ -1266,7 +1276,11 @@ namespace Pal3.Game.Command
         {
             if (x < 0 || x >= 1280 || y < 0 || y >= 720)
                 throw new InvalidOperationException($"Input coordinate ({x}, {y}) is outside 1280x720.");
-            return new Vector2(x, y);
+            if (Screen.width <= 0 || Screen.height <= 0)
+                throw new InvalidOperationException("GameView has no input surface.");
+            return new Vector2(
+                x * (Screen.width / 1280f),
+                y * (Screen.height / 720f));
         }
 
         static int QueueC1Action(WarptestC1InputAction action)
