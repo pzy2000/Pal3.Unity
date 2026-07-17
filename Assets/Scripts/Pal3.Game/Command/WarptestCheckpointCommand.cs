@@ -25,6 +25,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using UnityEngine;
 
@@ -87,8 +88,41 @@ namespace Pal3.Game.Command
         static readonly Dictionary<string, WarptestC1Report> s_c1InputReceipts = new Dictionary<string, WarptestC1Report>();
         static string s_c1SessionId = "";
 
+#if UNITY_EDITOR_OSX
+        const string ObjectiveCLibrary = "/usr/lib/libobjc.A.dylib";
+        [DllImport(ObjectiveCLibrary)] static extern IntPtr objc_getClass(string name);
+        [DllImport(ObjectiveCLibrary)] static extern IntPtr sel_registerName(string name);
+        [DllImport(ObjectiveCLibrary, EntryPoint = "objc_msgSend")]
+        static extern IntPtr ObjcMessage(IntPtr receiver, IntPtr selector);
+        [DllImport(ObjectiveCLibrary, EntryPoint = "objc_msgSend")]
+        static extern bool ObjcMessageInteger(IntPtr receiver, IntPtr selector, long value);
+        [DllImport(ObjectiveCLibrary, EntryPoint = "objc_msgSend")]
+        static extern void ObjcMessageVoid(IntPtr receiver, IntPtr selector);
+#endif
+
+        internal static void EnforceC1BackgroundActivationPolicy()
+        {
+#if UNITY_EDITOR_OSX
+            try
+            {
+                IntPtr application = ObjcMessage(
+                    objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+                // NSApplicationActivationPolicyAccessory keeps the headed editor
+                // renderable without allowing it to displace the user's front app.
+                ObjcMessageInteger(application, sel_registerName("setActivationPolicy:"), 1);
+                ObjcMessageVoid(application, sel_registerName("deactivate"));
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[WarpTest C1] Unable to enforce background activation policy: {e.Message}");
+                throw;
+            }
+#endif
+        }
+
         internal static void ConfigureC1BackgroundSession(string sessionId)
         {
+            EnforceC1BackgroundActivationPolicy();
             s_c1SessionId = sessionId ?? "";
             s_c1PolicyFrameId = -1;
             s_c1PolicyFrameConsumed = true;
@@ -293,6 +327,7 @@ namespace Pal3.Game.Command
 
         public static void RunC1()
         {
+            EnforceC1BackgroundActivationPolicy();
             string requestPath = null;
             string reportPath = null;
             string readyPath = null;
@@ -1460,6 +1495,7 @@ namespace Pal3.Game.Command
                         yield break;
                     }
                     for (int i = 0; i < 5; i++) yield return null;
+                    yield return new WaitForEndOfFrame();
                     try
                     {
                         string directory = Path.GetDirectoryName(request.screenshot_output_path);
@@ -1703,6 +1739,7 @@ namespace Pal3.Game.Command
 
         void Update()
         {
+            WarptestCheckpoint.EnforceC1BackgroundActivationPolicy();
             WarptestCheckpoint.ObserveC1Transition();
             if (_busy || !File.Exists(_requestPath)) return;
             WarptestC1Request request;
