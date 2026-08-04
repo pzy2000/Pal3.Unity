@@ -15,6 +15,7 @@
  * save files and DevCommands story jumps), validates manager state, runs smoke
  * actions, checks oracle assertions, and writes a structured JSON report.
  *
+ * Supports pal3_toggle_world_map/pal3_toggle_main_menu for visual-pair capture.
  * RunC1 is a separate headed/persistent path. Its restore_target operation is
  * setup-only and cannot execute actions or assertions; the agent must perform
  * Phase B through the public game UI before read-only semantic_goal probing.
@@ -870,6 +871,78 @@ namespace Pal3.Game.Command
 
         static IEnumerator ExecuteAction(WarptestAction action, Action<WarptestCheck> done)
         {
+            // Generation-time UI settles used by visual-pair capture. These do not
+            // mutate oracle-checked story/inventory state; they only open overlays
+            // so after-frames carry task-discriminative pixels on dark q02 scenes.
+            if (action.type == "pal3_toggle_world_map")
+            {
+                try
+                {
+                    PalApp.Instance.Execute(new ToggleWorldMapRequest());
+                }
+                catch (Exception e)
+                {
+                    done(Fail($"action[{action.type}]", $"Toggle world map failed: {e.Message}"));
+                    yield break;
+                }
+                for (int i = 0; i < 45; i++) yield return null;
+                done(Ok($"action[{action.type}]", "Toggled world map overlay"));
+                yield break;
+            }
+
+            if (action.type == "pal3_toggle_main_menu")
+            {
+                try
+                {
+                    // MainMenu.ToggleMainMenu only opens from GameState.Gameplay, and a
+                    // synthesized or freshly restored checkpoint usually sits in UI or
+                    // Cutscene state, so the request would otherwise be a silent no-op.
+                    TryGetService<GameStateManager>()?.TryGoToState(GameState.Gameplay);
+                    PalApp.Instance.Execute(new ToggleMainMenuRequest());
+                }
+                catch (Exception e)
+                {
+                    done(Fail($"action[{action.type}]", $"Toggle main menu failed: {e.Message}"));
+                    yield break;
+                }
+                for (int i = 0; i < 45; i++) yield return null;
+                done(Ok($"action[{action.type}]", "Toggled main menu overlay"));
+                yield break;
+            }
+
+            if (action.type == "wait")
+            {
+                float seconds = action.seconds;
+                if (seconds <= 0f && action.ms > 0) seconds = action.ms / 1000f;
+                if (seconds < 0f || seconds > 5f)
+                {
+                    done(Fail($"action[{action.type}]", "Wait duration is outside 0..5 seconds."));
+                    yield break;
+                }
+                if (seconds > 0f) yield return new WaitForSecondsRealtime(seconds);
+                done(Ok($"action[{action.type}]", $"Waited {seconds:0.###}s"));
+                yield break;
+            }
+
+            if (action.type == "key")
+            {
+                // C# forbids yielding inside a try block that has a catch clause, so the
+                // queueing stays in the guarded block and the frame wait happens after it.
+                int queued;
+                try
+                {
+                    queued = QueueC1Key(action.key, action.modifiers);
+                }
+                catch (Exception e)
+                {
+                    done(Fail($"action[{action.type}]", $"Key action failed: {e.Message}"));
+                    yield break;
+                }
+                for (int i = 0; i < 20; i++) yield return null;
+                done(Ok($"action[{action.type}]", $"Queued key '{action.key}' ({queued} events)"));
+                yield break;
+            }
+
             if (action.type == "pal3_load_scene")
             {
                 bool loaded = false;
@@ -2068,6 +2141,10 @@ namespace Pal3.Game.Command
         public string city;
         public string scene;
         public int save_index;
+        public string key;
+        public string[] modifiers = System.Array.Empty<string>();
+        public float seconds;
+        public int ms;
     }
 
     [Serializable]
