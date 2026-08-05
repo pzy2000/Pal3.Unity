@@ -31,12 +31,14 @@ using System.Text;
 using UnityEngine;
 
 using Engine.Services;
+using Engine.Extensions;
 using IngameDebugConsole;
 using Pal3.Core.Command;
 using Pal3.Core.Command.SceCommands;
 using Pal3.Core.Contract.Constants;
 using Pal3.Core.Contract.Enums;
 using Pal3.Game.Command.Extensions;
+using Pal3.Game.Dev;
 using Pal3.Game.GamePlay;
 using Pal3.Game.GameSystems.Favor;
 using Pal3.Game.GameSystems.Inventory;
@@ -648,6 +650,33 @@ namespace Pal3.Game.Command
 
         static IEnumerator SynthesizeState(WarptestTarget target, List<WarptestCheck> checks)
         {
+            // Match the public flow before synthesizing a checkpoint: the first
+            // input dismisses LogoCanvas, then the chosen story-jump hides the
+            // title menu. Otherwise captures retain the frosted title artwork
+            // even though the requested scene has loaded behind it.
+#if UNITY_EDITOR
+            if (GameObject.Find("LogoCanvas") is { activeInHierarchy: true })
+            {
+                // EditorGUI game-view events do not reach InputSystem.onEvent
+                // reliably in a programmatic capture. Queue a real InputSystem
+                // keyboard state so Pal3.OnInputEvent follows the same path as a
+                // player's first key press and destroys LogoCanvas cleanly.
+                var keyboard = UnityEngine.InputSystem.Keyboard.current
+                    ?? UnityEngine.InputSystem.InputSystem.AddDevice<UnityEngine.InputSystem.Keyboard>();
+                UnityEngine.InputSystem.InputSystem.QueueStateEvent(
+                    keyboard,
+                    new UnityEngine.InputSystem.LowLevel.KeyboardState(
+                        UnityEngine.InputSystem.Key.Space));
+                for (int i = 0; i < 3; i++) yield return null;
+                UnityEngine.InputSystem.InputSystem.QueueStateEvent(
+                    keyboard,
+                    new UnityEngine.InputSystem.LowLevel.KeyboardState());
+                for (int i = 0; i < 7; i++) yield return null;
+            }
+#endif
+            TryGetService<MainMenu>()?.HideMenu();
+            for (int i = 0; i < 2; i++) yield return null;
+
             Exception failure = null;
             try
             {
@@ -698,6 +727,40 @@ namespace Pal3.Game.Command
                     checks.Add(Fail("target.state_synthesized",
                         $"Scene {target.scene_city}/{target.scene_name} did not load in time."));
                     yield break;
+                }
+                if (target.make_playable && !TryMakePlayableStoryScene(
+                    target.player_tile_x,
+                    target.player_tile_y,
+                    target.player_nav_layer,
+                    out string playableError))
+                {
+                    checks.Add(Fail("target.state_synthesized",
+                        $"Scene loaded but playable story setup failed: {playableError}"));
+                    yield break;
+                }
+                if (target.make_playable)
+                {
+                    for (int i = 0; i < 45; i++) yield return null;
+                    // ActorSetTilePosition updates PlayerActorManager on a later
+                    // frame. Reapply the transform after that position is live;
+                    // doing it synchronously above would still center the stale
+                    // title-scene location.
+                    var gameState = TryGetService<GameStateManager>();
+                    for (int i = 0; i < 300; i++)
+                    {
+                        if (gameState == null || gameState.TryGoToState(GameState.Gameplay)) break;
+                        yield return null;
+                    }
+                    for (int i = 0; i < 10; i++) yield return null;
+                    if (!TrySynchronizePlayerCameraAnchor(out string cameraAnchorError))
+                    {
+                        checks.Add(Fail("target.state_synthesized",
+                            $"Playable scene has no live player camera anchor: {cameraAnchorError}"));
+                        yield break;
+                    }
+                    PalApp.Instance.Execute(new CameraFollowPlayerCommand(1));
+                    PalApp.Instance.Execute(new CameraFocusOnActorCommand(-1));
+                    for (int i = 0; i < 15; i++) yield return null;
                 }
             }
 
@@ -814,6 +877,95 @@ namespace Pal3.Game.Command
                 yield return null;
             }
             done(false);
+        }
+
+        static bool TryMakePlayableStoryScene(
+            int playerTileX,
+            int playerTileY,
+            int playerNavLayer,
+            out string error)
+        {
+            try
+            {
+                // This is the shared tail of the public DevCommands story-jump
+                // recipes. SceneLoad alone preserves a stale actor/camera and can
+                // satisfy scene identifiers while rendering a black frame.
+                // The replay starts from the title screen, so also dismiss its
+                // frosted menu overlay and stop its camera-orbit coroutine just as
+                // selecting a story jump from MainMenu does.
+                TryGetService<MainMenu>()?.HideMenu();
+                PalApp.Instance.Execute(new ActorActivateCommand(-1, 1));
+                PalApp.Instance.Execute(new ActorEnablePlayerControlCommand(-1));
+                PalApp.Instance.Execute(new PlayerEnableInputCommand(1));
+                PalApp.Instance.Execute(new ActorSetNavLayerCommand(-1, playerNavLayer));
+                PalApp.Instance.Execute(new ActorSetTilePositionCommand(
+                    -1, playerTileX, playerTileY));
+                PalApp.Instance.Execute(new TeamAddOrRemoveActorCommand(0, 1));
+                // Scene loading can retain the title-screen transform. Reapply the
+                // normal gameplay camera after the player has been positioned.
+                PalApp.Instance.Execute(new CameraSetDefaultTransformCommand(0));
+                PalApp.Instance.Execute(new CameraFollowPlayerCommand(1));
+                PalApp.Instance.Execute(new CameraFadeInCommand());
+                error = null;
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
+        }
+
+        static bool TrySynchronizePlayerCameraAnchor(out string error)
+        {
+            try
+            {
+                var playerManager = TryGetService<PlayerActorManager>();
+                var scene = TryGetService<PalSceneManager>()?.GetCurrentScene();
+                if (playerManager == null || scene == null)
+                {
+                    error = "player or scene manager unavailable";
+                    return false;
+                }
+                var playerEntity = scene.GetActorGameEntity(playerManager.GetPlayerActorId());
+                if (playerEntity.IsNullOrDisposed())
+                {
+                    error = $"actor {playerManager.GetPlayerActorId()} is unavailable";
+                    return false;
+                }
+                playerManager.LastKnownPosition = playerEntity.Transform.Position;
+                // Build a deterministic third-person view around the live actor.
+                // This also replaces the startup camera's stale look-at point,
+                // which CameraSetDefaultTransform alone intentionally preserves.
+                Vector3 lookAt = playerEntity.Transform.Position + Vector3.up;
+                const float cameraPitch = -30.37f;
+                // Use scene-specific road-side views: q01's dense roofline and
+                // q02's foreground bushes occlude the cast from opposite angles.
+                float cameraYaw = string.Equals(
+                    scene.GetSceneInfo().CityName,
+                    "q01",
+                    StringComparison.OrdinalIgnoreCase) ? 75f : 127.35f;
+                const float cameraDistance = 46f;
+                Quaternion rotation = UnityPrimitivesConvertor.ToUnityQuaternion(
+                    cameraPitch, cameraYaw, 0f);
+                Vector3 cameraPosition = lookAt - rotation * Vector3.forward * cameraDistance;
+                var gameBoxPosition = cameraPosition.ToGameBoxPosition();
+                PalApp.Instance.Execute(new CameraSetFieldOfViewCommand(35f));
+                PalApp.Instance.Execute(new CameraSetTransformCommand(
+                    cameraYaw,
+                    cameraPitch,
+                    cameraDistance * UnityPrimitivesConvertor.GameBoxUnitToUnityUnit,
+                    gameBoxPosition.X,
+                    gameBoxPosition.Y,
+                    gameBoxPosition.Z));
+                error = null;
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
         }
 
         // ---- Validation ----
@@ -947,8 +1099,41 @@ namespace Pal3.Game.Command
             {
                 bool loaded = false;
                 yield return LoadSceneAndWait(action.city, action.scene, ok => loaded = ok);
+                if (loaded && action.make_playable)
+                {
+                    if (!TryMakePlayableStoryScene(
+                        action.player_tile_x,
+                        action.player_tile_y,
+                        action.player_nav_layer,
+                        out string playableError))
+                    {
+                        done(Fail($"action[{action.type}]",
+                            $"Scene loaded but playable story setup failed: {playableError}"));
+                        yield break;
+                    }
+                    for (int i = 0; i < 45; i++) yield return null;
+                    var gameState = TryGetService<GameStateManager>();
+                    for (int i = 0; i < 300; i++)
+                    {
+                        if (gameState == null || gameState.TryGoToState(GameState.Gameplay)) break;
+                        yield return null;
+                    }
+                    for (int i = 0; i < 10; i++) yield return null;
+                    if (!TrySynchronizePlayerCameraAnchor(out string cameraAnchorError))
+                    {
+                        done(Fail($"action[{action.type}]",
+                            $"Playable scene has no live player camera anchor: {cameraAnchorError}"));
+                        yield break;
+                    }
+                    PalApp.Instance.Execute(new CameraFollowPlayerCommand(1));
+                    PalApp.Instance.Execute(new CameraFocusOnActorCommand(-1));
+                    for (int i = 0; i < 15; i++) yield return null;
+                }
                 done(loaded
-                    ? Ok($"action[{action.type}]", $"Loaded scene {action.city}/{action.scene}")
+                    ? Ok($"action[{action.type}]", action.make_playable
+                        ? $"Loaded playable scene {action.city}/{action.scene} at tile "
+                            + $"({action.player_tile_x},{action.player_tile_y})"
+                        : $"Loaded scene {action.city}/{action.scene}")
                     : Fail($"action[{action.type}]", $"Scene {action.city}/{action.scene} failed to load"));
                 yield break;
             }
@@ -2078,6 +2263,10 @@ namespace Pal3.Game.Command
         public WarptestRegionEntry[] world_regions;
         public WarptestFavorEntry[] favors;
         public WarptestPosition position;
+        public bool make_playable;
+        public int player_tile_x;
+        public int player_tile_y;
+        public int player_nav_layer;
     }
 
     [Serializable]
@@ -2140,6 +2329,10 @@ namespace Pal3.Game.Command
         public int flag;
         public string city;
         public string scene;
+        public bool make_playable;
+        public int player_tile_x;
+        public int player_tile_y;
+        public int player_nav_layer;
         public int save_index;
         public string key;
         public string[] modifiers = System.Array.Empty<string>();
