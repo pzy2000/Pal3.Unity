@@ -15,7 +15,8 @@
  * save files and DevCommands story jumps), validates manager state, runs smoke
  * actions, checks oracle assertions, and writes a structured JSON report.
  *
- * Supports pal3_toggle_world_map/pal3_toggle_main_menu for visual-pair capture.
+ * Supports pal3_toggle_world_map/pal3_toggle_main_menu/pal3_team_open for
+ * visual-pair capture.
  * RunC1 is a separate headed/persistent path. Its restore_target operation is
  * setup-only and cannot execute actions or assertions; the agent must perform
  * Phase B through the public game UI before read-only semantic_goal probing.
@@ -37,6 +38,7 @@ using Pal3.Core.Command;
 using Pal3.Core.Command.SceCommands;
 using Pal3.Core.Contract.Constants;
 using Pal3.Core.Contract.Enums;
+using Pal3.Game.Actor.Controllers;
 using Pal3.Game.Command.Extensions;
 using Pal3.Game.Dev;
 using Pal3.Game.GamePlay;
@@ -377,6 +379,9 @@ namespace Pal3.Game.Command
             {
                 Debug.LogWarning($"[WarpTest C1] Unable to open {GameScenePath}: {e.Message}");
             }
+            // See TryQueuePlayModeRun: the GameView has to be its final size before
+            // the session starts, or the first captures land mid-relayout.
+            EnsureCaptureResolution();
             UnityEditor.EditorPrefs.SetBool(C1PendingKey, true);
             UnityEditor.EditorPrefs.SetString(C1RequestPathKey, requestPath);
             UnityEditor.EditorPrefs.SetString(C1ReportPathKey, reportPath);
@@ -433,6 +438,10 @@ namespace Pal3.Game.Command
                 Debug.LogWarning($"[WarpTest] Unable to open {GameScenePath} before play mode: {e.Message}");
             }
 
+            // Resize the GameView before play mode: changing the rendering
+            // resolution mid-session re-lays out the frame, and a capture taken
+            // right after lands on the blank frame in between.
+            EnsureCaptureResolution();
             UnityEditor.EditorPrefs.SetBool(PendingKey, true);
             UnityEditor.EditorPrefs.SetString(PendingRequestPathKey, requestPath);
             UnityEditor.EditorPrefs.SetString(PendingReportPathKey, reportPath);
@@ -1042,6 +1051,43 @@ namespace Pal3.Game.Command
                 yield break;
             }
 
+            // PAL3 draws no HUD for money, items or party, so a save roundtrip that
+            // only changes those is invisible in the field view. TeamOpen spawns the
+            // non-player team members as visible actors beside the player, which is
+            // the one surface where party membership becomes task-discriminative
+            // pixels. Generation-only: it moves team actors that the oracle does not
+            // assert positions for, and never touches story vars, money or items.
+            if (action.type == "pal3_team_open" || action.type == "pal3_team_close")
+            {
+                int teamSizeBefore;
+                try
+                {
+                    var teamManager = TryGetService<TeamManager>();
+                    if (teamManager == null)
+                    {
+                        done(Fail($"action[{action.type}]", "TeamManager is unavailable."));
+                        yield break;
+                    }
+                    teamSizeBefore = teamManager.GetActorsInTeam().Count;
+                    if (action.type == "pal3_team_open")
+                        PalApp.Instance.Execute(new TeamOpenCommand());
+                    else
+                        PalApp.Instance.Execute(new TeamCloseCommand());
+                }
+                catch (Exception e)
+                {
+                    done(Fail($"action[{action.type}]", $"Team command failed: {e.Message}"));
+                    yield break;
+                }
+                for (int i = 0; i < 30; i++) yield return null;
+                if (action.type == "pal3_team_open") FrameTeamActorsBesidePlayer();
+                for (int i = 0; i < 10; i++) yield return null;
+                done(Ok($"action[{action.type}]",
+                    $"Executed {action.type} for a team of {teamSizeBefore} actor(s); "
+                    + DescribeTeamActorPlacement()));
+                yield break;
+            }
+
             if (action.type == "pal3_toggle_main_menu")
             {
                 try
@@ -1369,6 +1415,86 @@ namespace Pal3.Game.Command
             catch { return 0; }
         }
 
+        // TeamOpen snaps followers onto the tilemap, but a checkpoint restored
+        // without a playable scene leaves the player itself at the engine's
+        // off-scene init position, so the follower lands on the ground far below
+        // and never enters the frame. Put the followers beside the player in view
+        // space instead. Generation-only: these tasks assert party membership,
+        // never actor positions, and the graded actions have already run.
+        static void FrameTeamActorsBesidePlayer()
+        {
+            try
+            {
+                var scene = TryGetService<PalSceneManager>()?.GetCurrentScene();
+                var playerManager = TryGetService<PlayerActorManager>();
+                var teamManager = TryGetService<TeamManager>();
+                if (scene == null || playerManager == null || teamManager == null) return;
+                int playerActorId = playerManager.GetPlayerActorId();
+                var playerEntity = scene.GetActorGameEntity(playerActorId);
+                if (playerEntity.IsNullOrDisposed()) return;
+                Vector3 playerPosition = playerEntity.Transform.Position;
+                var camera = UnityEngine.Camera.main;
+                Vector3 sideways = camera != null ? camera.transform.right : Vector3.right;
+                sideways.y = 0f;
+                if (sideways.sqrMagnitude < 0.0001f) sideways = Vector3.right;
+                sideways = sideways.normalized;
+                int index = 0;
+                foreach (var actor in teamManager.GetActorsInTeam())
+                {
+                    if ((int)actor == playerActorId) continue;
+                    var entity = scene.GetActorGameEntity((int)actor);
+                    if (entity.IsNullOrDisposed()) continue;
+                    index++;
+                    entity.Transform.Position = playerPosition + sideways * (2.2f * index);
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[WarpTest] Unable to frame team actors: {e.Message}");
+            }
+        }
+
+        // Reports where TeamOpen actually put the followers. The command reports
+        // success from the manager's point of view even when the tilemap snaps an
+        // actor somewhere the camera never looks, so the placement is recorded as
+        // evidence rather than assumed.
+        static string DescribeTeamActorPlacement()
+        {
+            try
+            {
+                var scene = TryGetService<PalSceneManager>()?.GetCurrentScene();
+                var playerManager = TryGetService<PlayerActorManager>();
+                var teamManager = TryGetService<TeamManager>();
+                if (scene == null || playerManager == null || teamManager == null)
+                    return "placement unknown (managers unavailable)";
+                int playerActorId = playerManager.GetPlayerActorId();
+                var playerEntity = scene.GetActorGameEntity(playerActorId);
+                Vector3 playerPosition = playerEntity.IsNullOrDisposed()
+                    ? Vector3.zero : playerEntity.Transform.Position;
+                var parts = new List<string>();
+                parts.Add($"player {playerActorId} at {playerPosition}");
+                foreach (var actor in teamManager.GetActorsInTeam())
+                {
+                    if ((int)actor == playerActorId) continue;
+                    var entity = scene.GetActorGameEntity((int)actor);
+                    if (entity.IsNullOrDisposed())
+                    {
+                        parts.Add($"actor {(int)actor} has no entity");
+                        continue;
+                    }
+                    var controller = entity.GetComponent<ActorController>();
+                    bool active = controller != null && controller.IsActive;
+                    parts.Add($"actor {(int)actor} active={active} at {entity.Transform.Position} "
+                        + $"(distance {Vector3.Distance(playerPosition, entity.Transform.Position):0.##})");
+                }
+                return string.Join("; ", parts);
+            }
+            catch (Exception e)
+            {
+                return $"placement unknown ({e.Message})";
+            }
+        }
+
         static bool CurrentSceneInfo(out string city, out string name)
         {
             city = null;
@@ -1411,10 +1537,113 @@ namespace Pal3.Game.Command
 
         // ---- Final GameView screenshot capture (includes overlay UI) ----
 
+        // Screen capture reads Screen.width x Screen.height pixels from the
+        // bottom-left of the GameView surface. The editor reports Screen in points
+        // while the surface is pixelsPerPoint times larger on a HiDPI display, so
+        // the readback silently kept only the bottom-left quarter of the frame:
+        // the historical PAL3 goldens are that quarter magnified 2x, which is why
+        // the world map's centered region buttons looked "outside the viewport".
+        //
+        // Asking for a smaller custom resolution does not help, because a render
+        // smaller than the surface is letterboxed into the middle of it and the
+        // bottom-left readback then straddles the bars. Pinning the rendering
+        // resolution to the surface's own device size is what makes Screen and the
+        // surface agree, so the readback covers exactly the rendered frame. The
+        // capture is then normalized to a fixed frame so the policy contract and
+        // the goldens stay a stable size.
+        const int CaptureFrameWidth = 1280;
+        const int CaptureFrameHeight = 720;
+
+#if UNITY_EDITOR
+        const string CaptureSurfaceSizeName = "WarpTest full-surface capture";
+        // Editor chrome above the rendered game in a docked GameView: the window tab
+        // strip plus the view's own toolbar, in editor points. Measured against a
+        // captured frame, where it is the offset of the game's top edge.
+        const float GameViewChromePoints = 43.5f;
+        static bool s_captureResolutionPinned;
+        // Fraction of the readback occupied by the game, see PinGameView... below.
+        static float s_captureGameFraction = 1f;
+
+        static void PinGameViewRenderingResolution()
+        {
+            if (s_captureResolutionPinned) return;
+            // Latch first: if the editor refuses the request there is no point
+            // repeating it on every capture, and the guards below will report it.
+            s_captureResolutionPinned = true;
+
+            // Derive the surface from the GameView window rect rather than from
+            // PlayModeWindow.GetRenderingResolution: the latter reports the display
+            // while the view is unpinned and the pinned value afterwards, so reading
+            // it back would compound the scale factor on every run. The window rect
+            // is in points and is unaffected by whatever resolution is selected.
+            var window = TryGetGameViewWindow();
+            if (window == null) return;
+            float pixelsPerPoint = UnityEditor.EditorGUIUtility.pixelsPerPoint;
+            if (pixelsPerPoint <= 0f) pixelsPerPoint = 1f;
+            var rect = window.position;
+            int deviceWidth = Mathf.RoundToInt(rect.width * pixelsPerPoint);
+            int deviceHeight = Mathf.RoundToInt(rect.height * pixelsPerPoint);
+            if (deviceWidth <= 0 || deviceHeight <= 0) return;
+
+            // The readback covers the whole window, chrome included, so ask for a
+            // render the size of the window: anything smaller is letterboxed into
+            // the middle of it and the readback then straddles the bars. Unity fits
+            // that render into the chrome-free area, which scales it by exactly the
+            // fraction of the window the game occupies and centres it horizontally.
+            // Cropping by that same fraction is what turns the window readback back
+            // into the game frame.
+            s_captureGameFraction = Mathf.Clamp01(
+                (deviceHeight - GameViewChromePoints * pixelsPerPoint) / deviceHeight);
+            UnityEditor.PlayModeWindow.SetCustomRenderingResolution(
+                (uint)deviceWidth, (uint)deviceHeight, CaptureSurfaceSizeName);
+            Debug.Log($"[WarpTest] Pinned GameView rendering resolution to {deviceWidth}x{deviceHeight} "
+                + $"(window {rect.width}x{rect.height} pt at {pixelsPerPoint:0.##} px/pt, "
+                + $"game fraction {s_captureGameFraction:0.####}).");
+        }
+
+        static UnityEditor.EditorWindow TryGetGameViewWindow()
+        {
+            var type = Type.GetType("UnityEditor.GameView,UnityEditor");
+            if (type == null) return null;
+            var windows = UnityEngine.Resources.FindObjectsOfTypeAll(type);
+            if (windows == null || windows.Length == 0) return null;
+            return windows[0] as UnityEditor.EditorWindow;
+        }
+#endif
+
+        static void EnsureCaptureResolution()
+        {
+#if UNITY_EDITOR
+            PinGameViewRenderingResolution();
+#endif
+        }
+
+        // Sub-rectangle of the readback that holds the game, as a Graphics.Blit
+        // scale/offset pair in bottom-left UV space. The game sits against the
+        // bottom edge because the chrome is above it, so only x needs centring.
+        static void CaptureGameViewport(out Vector2 scale, out Vector2 offset)
+        {
+            float fraction = 1f;
+#if UNITY_EDITOR
+            fraction = s_captureGameFraction;
+#endif
+            scale = new Vector2(fraction, fraction);
+            offset = new Vector2((1f - fraction) * 0.5f, 0f);
+        }
+
         static string CaptureScreenshotToFile(string outputPath)
         {
+            int sourceWidth, sourceHeight;
+            return CaptureScreenshotToFile(outputPath, out sourceWidth, out sourceHeight);
+        }
+
+        static string CaptureScreenshotToFile(string outputPath, out int sourceWidth, out int sourceHeight)
+        {
+            sourceWidth = 0;
+            sourceHeight = 0;
             if (Application.isPlaying)
             {
+                EnsureCaptureResolution();
                 var source = ScreenCapture.CaptureScreenshotAsTexture();
                 RenderTexture normalizedTarget = null;
                 Texture2D texture = null;
@@ -1423,15 +1652,28 @@ namespace Pal3.Game.Command
                 {
                     if (source != null)
                     {
-                        normalizedTarget = RenderTexture.GetTemporary(1280, 720, 0, RenderTextureFormat.ARGB32);
-                        Graphics.Blit(source, normalizedTarget);
+                        sourceWidth = source.width;
+                        sourceHeight = source.height;
+                        // Fail loudly rather than writing a cropped frame: a readback
+                        // that does not span the surface would hand the policy an
+                        // image whose pixel coordinates no longer address the game.
+                        if (sourceWidth != Screen.width || sourceHeight != Screen.height)
+                            throw new InvalidOperationException(
+                                $"GameView readback {sourceWidth}x{sourceHeight} does not match the "
+                                + $"{Screen.width}x{Screen.height} frame; the capture would be cropped.");
+                        normalizedTarget = RenderTexture.GetTemporary(
+                            CaptureFrameWidth, CaptureFrameHeight, 0, RenderTextureFormat.ARGB32);
+                        Vector2 viewportScale, viewportOffset;
+                        CaptureGameViewport(out viewportScale, out viewportOffset);
+                        Graphics.Blit(source, normalizedTarget, viewportScale, viewportOffset);
                         RenderTexture.active = normalizedTarget;
-                        texture = new Texture2D(1280, 720, TextureFormat.RGB24, false);
-                        texture.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0);
+                        texture = new Texture2D(CaptureFrameWidth, CaptureFrameHeight, TextureFormat.RGB24, false);
+                        texture.ReadPixels(new Rect(0, 0, CaptureFrameWidth, CaptureFrameHeight), 0, 0);
                         texture.Apply();
                         File.WriteAllBytes(outputPath, texture.EncodeToPNG());
                         if (TextureHasVisibleRange(texture))
-                            return $"ScreenCapture captured final GameView pixels including overlay UI and normalized {source.width}x{source.height} to 1280x720.";
+                            return $"ScreenCapture captured the full {sourceWidth}x{sourceHeight} GameView frame "
+                                + $"including overlay UI and normalized it to {CaptureFrameWidth}x{CaptureFrameHeight}.";
                     }
                 }
                 finally
@@ -1567,13 +1809,25 @@ namespace Pal3.Game.Command
 
         static Vector2 C1Point(int x, int y)
         {
-            if (x < 0 || x >= 1280 || y < 0 || y >= 720)
-                throw new InvalidOperationException($"Input coordinate ({x}, {y}) is outside 1280x720.");
+            if (x < 0 || x >= CaptureFrameWidth || y < 0 || y >= CaptureFrameHeight)
+                throw new InvalidOperationException(
+                    $"Input coordinate ({x}, {y}) is outside {CaptureFrameWidth}x{CaptureFrameHeight}.");
             if (Screen.width <= 0 || Screen.height <= 0)
                 throw new InvalidOperationException("GameView has no input surface.");
+            EnsureCaptureResolution();
+            // Invert the capture transform: the policy aims at pixels of the cropped
+            // game viewport, so a click has to be placed inside that same viewport
+            // rather than across the whole readback. Queued GameView events are in
+            // editor points while the readback is in device pixels.
+            Vector2 viewportScale, viewportOffset;
+            CaptureGameViewport(out viewportScale, out viewportOffset);
+            float pixelsPerPoint = UnityEditor.EditorGUIUtility.pixelsPerPoint;
+            if (pixelsPerPoint <= 0f) pixelsPerPoint = 1f;
+            float normalizedX = viewportOffset.x + (x / (float)CaptureFrameWidth) * viewportScale.x;
+            float normalizedY = (y / (float)CaptureFrameHeight) * viewportScale.y;
             return new Vector2(
-                x * (Screen.width / 1280f),
-                y * (Screen.height / 720f));
+                normalizedX * Screen.width / pixelsPerPoint,
+                normalizedY * Screen.height / pixelsPerPoint);
         }
 
         static int QueueC1Action(WarptestC1InputAction action)
@@ -1758,15 +2012,22 @@ namespace Pal3.Game.Command
                     {
                         string directory = Path.GetDirectoryName(request.screenshot_output_path);
                         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-                        string detail = CaptureScreenshotToFile(request.screenshot_output_path);
+                        int capturedWidth, capturedHeight;
+                        string detail = CaptureScreenshotToFile(
+                            request.screenshot_output_path, out capturedWidth, out capturedHeight);
                         s_c1PolicyFrameId++;
                         s_c1PolicyFrameConsumed = false;
                         report.screenshot_status = "success";
                         report.screenshot_source = "unity_gameview_capture";
                         report.screenshot_detail = detail;
                         report.frame_id = s_c1PolicyFrameId;
-                        report.frame_width = 1280;
-                        report.frame_height = 720;
+                        report.frame_width = CaptureFrameWidth;
+                        report.frame_height = CaptureFrameHeight;
+                        // Measured, not assumed: the previous hardcoded pair made the
+                        // Python-side dimension check tautological, which is how a
+                        // half-visible frame went unnoticed for the whole catalog.
+                        report.capture_source_width = capturedWidth;
+                        report.capture_source_height = capturedHeight;
                         checks.Add(Ok("c1.live_capture", detail));
                     }
                     catch (Exception e)
@@ -2159,6 +2420,8 @@ namespace Pal3.Game.Command
         public int frame_id = -1;
         public int frame_width;
         public int frame_height;
+        public int capture_source_width;
+        public int capture_source_height;
         public string batch_id;
         public bool accepted;
         public int event_count;
