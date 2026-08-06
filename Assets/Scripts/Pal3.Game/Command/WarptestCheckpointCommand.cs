@@ -1316,7 +1316,7 @@ namespace Pal3.Game.Command
                     case "pal3_world_region_enabled":
                     {
                         int flag = RegionFlag(assertion.region);
-                        bool ok = assertion.int_value > 0 ? flag >= assertion.int_value : flag > 0;
+                        bool ok = flag >= assertion.int_value;
                         return new WarptestCheck
                         {
                             name = $"assertion[{assertion.type}].region_{assertion.region}",
@@ -1560,6 +1560,9 @@ namespace Pal3.Game.Command
         // strip plus the view's own toolbar, in editor points. Measured against a
         // captured frame, where it is the offset of the game's top edge.
         const float GameViewChromePoints = 43.5f;
+        const string CaptureSurfaceWidthKey = "WarpTest.Pal3.CaptureSurfaceWidth";
+        const string CaptureSurfaceHeightKey = "WarpTest.Pal3.CaptureSurfaceHeight";
+        const string CaptureSurfaceFractionKey = "WarpTest.Pal3.CaptureSurfaceFraction";
         static bool s_captureResolutionPinned;
         // Fraction of the readback occupied by the game, see PinGameView... below.
         static float s_captureGameFraction = 1f;
@@ -1570,6 +1573,14 @@ namespace Pal3.Game.Command
             // Latch first: if the editor refuses the request there is no point
             // repeating it on every capture, and the guards below will report it.
             s_captureResolutionPinned = true;
+
+            // Entering play mode reloads the domain, which resets the statics above
+            // and runs this a second time from inside play mode. There
+            // EditorGUIUtility.pixelsPerPoint has no IMGUI context and reports 1, so
+            // recomputing would re-pin the surface at half its device size and drop
+            // the capture below the policy frame. The pre-play-mode measurement is
+            // the trustworthy one; reuse it rather than measuring again.
+            if (Application.isPlaying && TryReusePinnedCaptureSurface()) return;
 
             // Derive the surface from the GameView window rect rather than from
             // PlayModeWindow.GetRenderingResolution: the latter reports the display
@@ -1594,11 +1605,35 @@ namespace Pal3.Game.Command
             // into the game frame.
             s_captureGameFraction = Mathf.Clamp01(
                 (deviceHeight - GameViewChromePoints * pixelsPerPoint) / deviceHeight);
+            UnityEditor.EditorPrefs.SetInt(CaptureSurfaceWidthKey, deviceWidth);
+            UnityEditor.EditorPrefs.SetInt(CaptureSurfaceHeightKey, deviceHeight);
+            UnityEditor.EditorPrefs.SetFloat(
+                CaptureSurfaceFractionKey, s_captureGameFraction);
             UnityEditor.PlayModeWindow.SetCustomRenderingResolution(
                 (uint)deviceWidth, (uint)deviceHeight, CaptureSurfaceSizeName);
             Debug.Log($"[WarpTest] Pinned GameView rendering resolution to {deviceWidth}x{deviceHeight} "
                 + $"(window {rect.width}x{rect.height} pt at {pixelsPerPoint:0.##} px/pt, "
                 + $"game fraction {s_captureGameFraction:0.####}).");
+        }
+
+        static bool TryReusePinnedCaptureSurface()
+        {
+            int width = UnityEditor.EditorPrefs.GetInt(CaptureSurfaceWidthKey, 0);
+            int height = UnityEditor.EditorPrefs.GetInt(CaptureSurfaceHeightKey, 0);
+            float fraction = UnityEditor.EditorPrefs.GetFloat(CaptureSurfaceFractionKey, 0f);
+            if (width <= 0 || height <= 0 || fraction <= 0f) return false;
+            s_captureGameFraction = fraction;
+            // The pin itself survives the domain reload, so re-applying it would only
+            // re-lay out the frame and blank the next capture. Set it again only if
+            // the editor came back with a different resolution.
+            uint currentWidth, currentHeight;
+            UnityEditor.PlayModeWindow.GetRenderingResolution(out currentWidth, out currentHeight);
+            if (currentWidth != (uint)width || currentHeight != (uint)height)
+                UnityEditor.PlayModeWindow.SetCustomRenderingResolution(
+                    (uint)width, (uint)height, CaptureSurfaceSizeName);
+            Debug.Log($"[WarpTest] Reused the pre-play-mode GameView rendering resolution "
+                + $"{width}x{height} (game fraction {fraction:0.####}).");
+            return true;
         }
 
         static UnityEditor.EditorWindow TryGetGameViewWindow()
